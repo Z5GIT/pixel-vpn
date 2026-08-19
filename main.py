@@ -17,13 +17,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
 import logging
+import sys
+
+# وقتی فایل مستقیم با `python main.py` اجرا می‌شود، ماژول‌های relay/xhttp آن را با نام `main` import می‌کنند.
+# این alias جلوی ساخته‌شدن یک ماژول دوم و خطای circular import را می‌گیرد.
+if __name__ == "__main__":
+    sys.modules.setdefault("main", sys.modules[__name__])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("X4G")
+logger = logging.getLogger("Pixelgit")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="X4G", docs_url=None, redoc_url=None)
+app = FastAPI(title="Pixelgit", docs_url=None, redoc_url=None)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -69,7 +75,7 @@ app.add_middleware(
 )
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, TELEGRAM_CONFIG, FREE_CLAIMS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -79,13 +85,12 @@ async def load_state():
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
             if "password_hash" in data:
-                stored_hash = str(data["password_hash"])
-                # اگر رمز ذخیره‌شده همان رمز پیش‌فرض قبلی پروژه بوده، آن را به پیش‌فرض جدید منتقل کن؛
-                # رمزهای سفارشی کاربران دست‌نخورده باقی می‌مانند.
-                if stored_hash == hash_password("X4GKING"):
-                    AUTH["password_hash"] = hash_password("pixelgit")
-                else:
-                    AUTH["password_hash"] = stored_hash
+                AUTH["password_hash"] = data["password_hash"]
+                # مهاجرت امن رمز پیش‌فرض قدیمی به pixelgit فقط وقتی هنوز همان رمز قبلی است.
+                if data["password_hash"] == hash_password("X4GKING"):
+                    AUTH["password_hash"] = hash_password(DEFAULT_ADMIN_PASSWORD)
+            TELEGRAM_CONFIG.update(data.get("telegram_config", {}))
+            FREE_CLAIMS.update(data.get("free_claims", {}))
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -98,6 +103,8 @@ async def save_state():
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
+                "telegram_config": dict(TELEGRAM_CONFIG),
+                "free_claims": dict(FREE_CLAIMS),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -123,6 +130,12 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
+TELEGRAM_CONFIG = {
+    "bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+    "admin_ids": [int(x) for x in os.environ.get("TELEGRAM_ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()],
+    "channel_id": os.environ.get("TELEGRAM_CHANNEL_ID", "").strip(),
+}
+FREE_CLAIMS: dict[str, dict] = {}
 
 # پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
@@ -161,7 +174,8 @@ SESSION_TTL = 60 * 60 * 24 * 365
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "pixelgit"))}
+DEFAULT_ADMIN_PASSWORD = "pixelgit"
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -207,7 +221,7 @@ async def startup():
     await load_state()
     await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"X4G v9.5 started on port {CONFIG['port']}")
+    logger.info(f"Pixelgit v9.5 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -240,7 +254,7 @@ def now_ir() -> datetime:
 def generate_vless_link(
     uuid: str,
     host: str,
-    remark: str = "",
+    remark: str = "Pixelgit",
     protocol: str = DEFAULT_PROTOCOL,
     fingerprint: str | None = None,
     alpn: str | None = None,
@@ -291,7 +305,7 @@ def vless_link_for_link(link: dict, uid: str, host: str) -> str:
     proto = link.get("protocol", DEFAULT_PROTOCOL)
     return generate_vless_link(
         uid, host,
-        remark=link.get("label", ""),
+        remark=f"Pixelgit-{link.get('label','')}",
         protocol=proto,
         fingerprint=link.get("fingerprint"),
         alpn=link.get("alpn"),
@@ -414,7 +428,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "X4G", "version": "9.5", "status": "active", "channel": "https://t.me/pixelgit"}
+    return {"service": "Pixelgit", "version": "9.5", "status": "active", "channel": "https://t.me/pixelgit"}
 
 @app.get("/health")
 async def health():
@@ -619,6 +633,42 @@ async def api_logout(request: Request):
 @app.get("/api/me")
 async def api_me(request: Request):
     return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
+
+@app.get("/api/telegram/config")
+async def api_telegram_config(_=Depends(require_auth)):
+    cfg = dict(TELEGRAM_CONFIG)
+    return {
+        "bot_token": cfg.get("bot_token", ""),
+        "admin_ids": cfg.get("admin_ids", []),
+        "channel_id": cfg.get("channel_id", ""),
+        "enabled": bool(cfg.get("bot_token")),
+    }
+
+@app.put("/api/telegram/config")
+async def api_telegram_config_save(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = str(body.get("bot_token", "")).strip()
+    raw_admins = str(body.get("admin_ids", "")).strip()
+    channel = str(body.get("channel_id", "")).strip()
+    admin_ids = [int(x) for x in raw_admins.replace(" ", "").split(",") if x.isdigit()]
+    TELEGRAM_CONFIG.update({"bot_token": token, "admin_ids": admin_ids, "channel_id": channel})
+    await save_state()
+    try:
+        from telegram_bot import configure_bot
+        result = await configure_bot(token, admin_ids, channel)
+    except Exception as exc:
+        logger.exception("Telegram reconfiguration failed")
+        raise HTTPException(status_code=500, detail=f"راه‌اندازی ربات ناموفق بود: {exc}")
+    log_activity("telegram", "تنظیمات ربات تلگرام از پنل تغییر کرد", "ok")
+    return {"ok": True, "message": result}
+
+@app.post("/api/mtproto/generate")
+async def api_mtproto_generate(request: Request, _=Depends(require_auth)):
+    host = get_host(request)
+    secret = secrets.token_hex(16)
+    port = 443
+    url = f"tg://proxy?server={quote(host)}&port={port}&secret={secret}"
+    return {"ok": True, "experimental": True, "server": host, "port": port, "secret": secret, "url": url}
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, token=Depends(require_auth)):

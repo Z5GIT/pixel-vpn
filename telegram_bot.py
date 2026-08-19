@@ -7,9 +7,6 @@
 import asyncio
 import os
 import re
-import json
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -40,20 +37,15 @@ from main import (
     create_sub_group,
     set_link_sub,
     remove_sub_group,
+    TELEGRAM_CONFIG,
+    FREE_CLAIMS,
+    save_state,
+    now_ir,
 )
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-_admin_ids_raw = os.environ.get("TELEGRAM_ADMIN_IDS", "").strip()
-ADMIN_IDS = {int(x) for x in _admin_ids_raw.replace(" ", "").split(",") if x.isdigit()} if _admin_ids_raw else set()
-
-# امکانات عمومی ربات
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-BOT_STATE_FILE = DATA_DIR / "telegram_bot_state.json"
-BOT_STATE = {"channel_id": TELEGRAM_CHANNEL_ID, "daily_claims": {}}
-IRAN_TZ = ZoneInfo("Asia/Tehran")
-FREE_VOLUME_BYTES = parse_size_to_bytes(1, "GB")
-
+BOT_TOKEN = str(TELEGRAM_CONFIG.get("bot_token", "")).strip()
+ADMIN_IDS = set(int(x) for x in TELEGRAM_CONFIG.get("admin_ids", []) if str(x).isdigit())
+CHANNEL_ID = str(TELEGRAM_CONFIG.get("channel_id", "")).strip()
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 PAGE_SIZE = 6
 
@@ -61,52 +53,6 @@ _client: httpx.AsyncClient | None = None
 _poll_task: asyncio.Task | None = None
 _running = False
 _pending: dict = {}   # chat_id -> {"action": "wizard", "step": "...", "data": {...}}
-
-
-def _load_bot_state():
-    global BOT_STATE
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if BOT_STATE_FILE.exists():
-            raw = json.loads(BOT_STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                BOT_STATE["channel_id"] = str(raw.get("channel_id") or TELEGRAM_CHANNEL_ID).strip()
-                claims = raw.get("daily_claims", {})
-                BOT_STATE["daily_claims"] = claims if isinstance(claims, dict) else {}
-    except Exception as e:
-        logger.warning(f"Telegram bot state load failed: {e}")
-
-
-def _save_bot_state():
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = BOT_STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(BOT_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(BOT_STATE_FILE)
-    except Exception as e:
-        logger.warning(f"Telegram bot state save failed: {e}")
-
-
-def _channel_id() -> str:
-    return str(BOT_STATE.get("channel_id") or "").strip()
-
-
-def _today_key() -> str:
-    return datetime.now(IRAN_TZ).date().isoformat()
-
-
-def _user_has_claimed_today(user_id: int) -> bool:
-    return BOT_STATE.get("daily_claims", {}).get(str(user_id)) == _today_key()
-
-
-def _mark_user_claimed_today(user_id: int):
-    BOT_STATE.setdefault("daily_claims", {})[str(user_id)] = _today_key()
-    _save_bot_state()
-
-
-def _is_admin(chat_id: int) -> bool:
-    return chat_id in ADMIN_IDS
-
 
 # ── Config creation wizard ────────────────────────────────────────────────────
 # مراحل ساخت کانفیگ جدید، دقیقاً هم‌راستا با فیلدهایی که پنل وب موقع ساخت کاربر می‌گیره:
@@ -197,16 +143,18 @@ async def _edit(chat_id: int, message_id: int, text: str, kb: dict | None = None
 async def _answer_cb(cb_id: str, text: str = ""):
     await _call("answerCallbackQuery", callback_query_id=cb_id, text=text)
 
+def _is_admin(chat_id: int) -> bool:
+    return chat_id in ADMIN_IDS
+
 # ── Keyboards ────────────────────────────────────────────────────────────────
 def _main_menu_kb():
-    rows = [
+    return {"inline_keyboard": [
         [{"text": "📋 لیست کانفیگ‌ها", "callback_data": "list:0"}],
         [{"text": "➕ ساخت کانفیگ جدید", "callback_data": "newcfg"}],
-        [{"text": "📣 ارسال کانفیگ به کانال", "callback_data": "channel:menu"}],
         [{"text": "🗂 گروه‌های ساب (لینک حرفه‌ای)", "callback_data": "subs:0"}],
+        [{"text": "📣 ارسال به کانال", "callback_data": "channelmenu"}],
         [{"text": "🔄 رفرش", "callback_data": "menu"}],
-    ]
-    return {"inline_keyboard": rows}
+    ]}
 
 def _links_list_kb(page: int):
     items = sorted(LINKS.items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True)
@@ -457,149 +405,40 @@ def _format_cfg_group(uid: str) -> str:
         "برای گرفتن لینک ساب حرفه‌ای (صفحه‌ی زیبا)، این کانفیگ رو به یک گروه اضافه کن یا یه گروه جدید بساز:"
     )
 
-# ── Public/free + channel helpers ───────────────────────────────────────────
-def _free_menu_kb():
-    return {"inline_keyboard": [[{"text": "🎁 دریافت کانفیگ رایگان ۱ گیگ", "callback_data": "free:1gb"}]]}
-
-
-def _channel_menu_kb():
-    return {"inline_keyboard": [
-        [{"text": "📤 ارسال کانفیگ با حجم دلخواه", "callback_data": "channel:post"}],
-        [{"text": "⚙️ تنظیم کانال", "callback_data": "channel:set"}],
-        [{"text": "⬅ منوی اصلی", "callback_data": "menu"}],
-    ]}
-
-
-def _channel_posted_text(label: str, vless: str, volume_gb: int, uid: str, host: str) -> str:
-    sub_url = f"https://{host}/sub/{uid}"
-    return (
-        f"📡 <b>کانفیگ {volume_gb} گیگ</b>\n\n"
-        f"🏷 {label}\n\n"
-        f"🔗 <code>{vless}</code>\n\n"
-        f"📥 لینک ساب: <code>{sub_url}</code>\n"
-        f"🛠 پشتیبانی: @pixelgit"
-    )
-
-
-async def _send_link_to_channel(uid: str, volume_gb: int | None = None):
-    channel = _channel_id()
-    if not channel:
-        return False, "کانال تنظیم نشده است. ابتدا /setchannel <channel_id> را اجرا کن."
-    link = LINKS.get(uid)
-    if not link:
-        return False, "کانفیگ پیدا نشد."
-    host = get_host()
-    vless = vless_link_for_link(link, uid, host)
-    shown_volume = volume_gb
-    if shown_volume is None:
-        limit = int(link.get("limit_bytes", 0) or 0)
-        shown_volume = max(0, round(limit / (1024 ** 3))) if limit else 0
-    res = await _send(channel, _channel_posted_text(link.get("label", "کانفیگ"), vless, shown_volume, uid, host))
-    if not res or not res.get("ok"):
-        return False, "ارسال به کانال انجام نشد؛ مطمئن شو ربات عضو کانال است و اجازه ارسال پیام دارد."
-    return True, f"✅ کانفیگ «{link.get('label','?')}» در کانال ارسال شد."
-
-
-async def _create_and_send_channel_config(volume_gb: int, admin_chat_id: int):
-    label = f"کانفیگ {volume_gb}GB"
-    uid, link = await make_link(
-        label=label,
-        limit_bytes=parse_size_to_bytes(volume_gb, "GB"),
-        protocol=DEFAULT_PROTOCOL,
-        fingerprint=DEFAULT_FINGERPRINT,
-        alpn="",
-        port=DEFAULT_PORT,
-        ip_limit=0,
-        speed_limit_bytes=0,
-    )
-    ok, msg = await _send_link_to_channel(uid, volume_gb)
-    if ok:
-        await _send(admin_chat_id, msg + f"\n\n🔗 لینک اتصال: <code>{vless_link_for_link(link, uid, get_host())}</code>")
-    else:
-        await _send(admin_chat_id, msg + f"\n\n⚠️ کانفیگ ساخته شد ولی ارسال نشد.\n🔗 <code>{vless_link_for_link(link, uid, get_host())}</code>")
-
-
-async def _claim_free_config(chat_id: int, user_id: int | None = None):
-    claim_id = int(user_id or chat_id)
-    if _user_has_claimed_today(claim_id):
-        await _send(chat_id, "⏳ سهمیه‌ی رایگان ۱ گیگ امروز را قبلاً دریافت کرده‌ای. فردا دوباره می‌توانی دریافت کنی.")
-        return
-    uid, link = await make_link(
-        label=f"رایگان 1GB - {chat_id}",
-        limit_bytes=FREE_VOLUME_BYTES,
-        protocol=DEFAULT_PROTOCOL,
-        fingerprint=DEFAULT_FINGERPRINT,
-        alpn="",
-        port=DEFAULT_PORT,
-        ip_limit=0,
-        speed_limit_bytes=0,
-    )
-    _mark_user_claimed_today(claim_id)
-    host = get_host()
-    vless = vless_link_for_link(link, uid, host)
-    sub_url = f"https://{host}/sub/{uid}"
-    await _send(
-        chat_id,
-        "🎁 <b>کانفیگ رایگان ۱ گیگ امروز</b>\n\n"
-        f"🔗 <code>{vless}</code>\n\n"
-        f"📥 لینک ساب: <code>{sub_url}</code>\n\n"
-        "✅ سهمیه‌ی امروز مصرف شد؛ فردا دوباره ۱ گیگ می‌توانی دریافت کنی.\n"
-        "🛠 پشتیبانی: @pixelgit",
-    )
-
-
 # ── Update handling ──────────────────────────────────────────────────────────
 async def _handle_message(msg: dict):
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
     if chat_id is None:
         return
-    is_admin = _is_admin(chat_id)
-    user_id = msg.get("from", {}).get("id") or chat_id
-
-    if text in ("/free", "/free1gb", "🎁 دریافت کانفیگ رایگان ۱ گیگ"):
-        await _claim_free_config(chat_id, user_id)
+    cmd = text.split("@", 1)[0].lower()
+    if cmd == "/free":
+        await _handle_free_command(chat_id)
+        return
+    if cmd == "/start" and not _is_admin(chat_id):
+        await _send(chat_id, "👋 خوش اومدی. برای دریافت کانفیگ رایگان روزانه، /free رو بزن.")
+        return
+    if not _is_admin(chat_id):
+        await _send(chat_id, "⛔ شما اجازه‌ی دسترسی به این ربات رو ندارید.")
         return
 
-    if text in ("/start", "/menu") and not is_admin:
-        _pending.pop(chat_id, None)
-        await _send(chat_id, "👋 خوش اومدی!\nهر روز می‌تونی یک کانفیگ رایگان ۱ گیگ دریافت کنی.", _free_menu_kb())
-        return
-
-    if not is_admin:
-        await _send(chat_id, "⛔ این بخش فقط برای مدیرهاست.\nبرای کانفیگ رایگان امروز روی دکمه‌ی زیر بزن.", _free_menu_kb())
+    if text.lower().startswith("/post"):
+        parts = text.split()
+        if len(parts) != 2:
+            await _send(chat_id, "فرمت: <code>/post 1GB</code> تا <code>/post 100GB</code>", _admin_channel_kb())
+            return
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*GB", parts[1], re.I)
+        if not m:
+            await _send(chat_id, "حجم را به‌صورت GB وارد کن، مثلاً <code>/post 10GB</code>")
+            return
+        gb = int(float(m.group(1)))
+        ok, result = await _send_to_channel_for_size(gb)
+        await _send(chat_id, ("✅ کانفیگ در کانال ارسال شد." if ok else f"❌ {result}"))
         return
 
     if text in ("/start", "/menu"):
         _pending.pop(chat_id, None)
-        await _send(chat_id, "👋 به ربات مدیریت X4G خوش اومدی.\nاز دکمه‌های زیر برای مدیریت کانفیگ‌ها استفاده کن:", _main_menu_kb())
-        return
-
-    # تنظیم کانال و ارسال کانفیگ ۱ تا ۱۰۰ گیگ؛ محدودیتی برای تعداد ارسال‌ها وجود ندارد.
-    if text.startswith("/setchannel"):
-        arg = text[len("/setchannel"):].strip()
-        if not arg:
-            await _send(chat_id, f"کانال فعلی: <code>{_channel_id() or 'تنظیم نشده'}</code>\n\nنمونه: <code>/setchannel -1001234567890</code>")
-            return
-        BOT_STATE["channel_id"] = arg
-        _save_bot_state()
-        await _send(chat_id, f"✅ کانال روی <code>{arg}</code> تنظیم شد.\nمطمئن شو ربات داخل کانال عضو و مجاز به ارسال پیام است.", _channel_menu_kb())
-        return
-
-    if text == "/channel":
-        await _send(chat_id, f"📣 کانال فعلی: <code>{_channel_id() or 'تنظیم نشده'}</code>", _channel_menu_kb())
-        return
-
-    if text.startswith("/post"):
-        raw = text[len("/post"):].strip().upper().replace("GB", "")
-        try:
-            volume_gb = int(raw)
-        except ValueError:
-            volume_gb = 0
-        if not (1 <= volume_gb <= 100):
-            await _send(chat_id, "❗️ حجم باید بین ۱ تا ۱۰۰ گیگ باشد.\nنمونه: <code>/post 10GB</code>")
-            return
-        await _create_and_send_channel_config(volume_gb, chat_id)
+        await _send(chat_id, "👋 به ربات مدیریت Pixelgit خوش اومدی.\nاز دکمه‌های زیر برای مدیریت کانفیگ‌ها استفاده کن:", _main_menu_kb())
         return
 
     if text == "/cancel":
@@ -608,26 +447,6 @@ async def _handle_message(msg: dict):
         return
 
     pending = _pending.get(chat_id)
-
-    if pending and pending.get("action") == "setchannel" and text:
-        BOT_STATE["channel_id"] = text.strip()
-        _save_bot_state()
-        _pending.pop(chat_id, None)
-        await _send(chat_id, f"✅ کانال روی <code>{_channel_id()}</code> تنظیم شد.\nمطمئن شو ربات عضو کانال و مجاز به ارسال پیام است.", _channel_menu_kb())
-        return
-
-    if pending and pending.get("action") == "channel_post" and text:
-        raw = text.upper().replace("GB", "").strip()
-        try:
-            volume_gb = int(raw)
-        except ValueError:
-            volume_gb = 0
-        if not (1 <= volume_gb <= 100):
-            await _send(chat_id, "❗️ حجم باید بین ۱ تا ۱۰۰ گیگ باشد:", _wizard_cancel_kb())
-            return
-        _pending.pop(chat_id, None)
-        await _create_and_send_channel_config(volume_gb, chat_id)
-        return
 
     if pending and pending.get("action") == "newsub" and pending.get("step") == "name" and text:
         name = text[:60]
@@ -725,22 +544,27 @@ async def _handle_callback(cb: dict):
     data = cb.get("data", "")
     cb_id = cb.get("id")
 
-    if chat_id is None:
-        await _answer_cb(cb_id, "⛔ درخواست نامعتبر")
-        return
-    user_id = cb.get("from", {}).get("id") or chat_id
-    if data == "free:1gb" and not _is_admin(chat_id):
-        await _answer_cb(cb_id)
-        await _claim_free_config(chat_id, user_id)
-        return
-    if not _is_admin(chat_id):
+    if chat_id is None or not _is_admin(chat_id):
         await _answer_cb(cb_id, "⛔ دسترسی نداری")
         return
     await _answer_cb(cb_id)
 
+    if data.startswith("post:"):
+        try:
+            gb = int(data.split(":",1)[1])
+        except ValueError:
+            gb = 1
+        ok, result = await _send_to_channel_for_size(gb)
+        await _send(chat_id, ("✅ کانفیگ در کانال ارسال شد." if ok else f"❌ {result}"))
+        return
+
     if data == "menu":
         _pending.pop(chat_id, None)
-        await _edit(chat_id, message_id, "منوی مدیریت X4G:", _main_menu_kb())
+        await _edit(chat_id, message_id, "منوی مدیریت Pixelgit:", _main_menu_kb())
+        return
+
+    if data == "channelmenu":
+        await _edit(chat_id, message_id, "📣 ارسال کانفیگ به کانال\n\nحجم را انتخاب کن:", _admin_channel_kb())
         return
 
     if data.startswith("list:"):
@@ -749,33 +573,6 @@ async def _handle_callback(cb: dict):
             await _edit(chat_id, message_id, "هنوز هیچ کانفیگی ساخته نشده.", _main_menu_kb())
             return
         await _edit(chat_id, message_id, f"📋 لیست کانفیگ‌ها ({len(LINKS)} مورد):", _links_list_kb(page))
-        return
-
-    if data == "free:1gb":
-        await _claim_free_config(chat_id, user_id)
-        return
-
-    if data == "channel:menu":
-        await _edit(chat_id, message_id, f"📣 مدیریت ارسال به کانال\n\nکانال فعلی: <code>{_channel_id() or 'تنظیم نشده'}</code>", _channel_menu_kb())
-        return
-
-    if data == "channel:set":
-        _pending[chat_id] = {"action": "setchannel"}
-        await _edit(chat_id, message_id, "🆔 شناسه یا @username کانال را بفرست:", _wizard_cancel_kb())
-        return
-
-    if data == "channel:post":
-        _pending[chat_id] = {"action": "channel_post"}
-        await _edit(chat_id, message_id, "📦 حجم کانفیگ را بین ۱ تا ۱۰۰ گیگ بفرست.\nمثلاً <code>10GB</code>", _wizard_cancel_kb())
-        return
-
-    if data == "channel:test":
-        channel = _channel_id()
-        if not channel:
-            await _answer_cb(cb_id, "ابتدا کانال را تنظیم کن.")
-            return
-        res = await _send(channel, "✅ تست ارسال ربات به کانال موفق بود.")
-        await _send(chat_id, "✅ پیام تست ارسال شد." if res and res.get("ok") else "❌ ارسال تست ناموفق بود؛ دسترسی ربات به کانال را بررسی کن.")
         return
 
     # ── گروه‌های ساب (لینک حرفه‌ای) ────────────────────────────────────────────
@@ -1043,6 +840,54 @@ async def _handle_callback(cb: dict):
             await _edit(chat_id, message_id, f"🗑 کانفیگ «{label}» حذف شد.", _main_menu_kb())
         return
 
+# ── Channel publishing / free 1GB ────────────────────────────────────────────
+def _admin_channel_kb():
+    return {"inline_keyboard": [
+        [{"text": "📣 ارسال ۱GB به کانال", "callback_data": "post:1"}],
+        [{"text": "📣 ارسال ۱۰GB به کانال", "callback_data": "post:10"}],
+        [{"text": "⬅ منوی اصلی", "callback_data": "menu"}],
+    ]}
+
+def _daily_free_key(chat_id: int) -> str:
+    return f"{chat_id}:{now_ir().strftime('%Y-%m-%d')}"
+
+async def _send_to_channel_for_size(gb: int):
+    if not CHANNEL_ID:
+        return False, "کانال تنظیم نشده است."
+    if gb < 1 or gb > 100:
+        return False, "حجم باید بین ۱ تا ۱۰۰ گیگ باشد."
+    label = f"Pixelgit {gb}GB · {now_ir().strftime('%Y-%m-%d %H:%M')}"
+    uid, link = await make_link(label=label, limit_bytes=parse_size_to_bytes(gb, "GB"), expires_at=None)
+    host = get_host()
+    vless = vless_link_for_link(link, uid, host)
+    text = (
+        f"<b>📦 کانفیگ Pixelgit · {gb}GB</b>\n\n"
+        f"نام: <b>{label}</b>\n"
+        f"حجم: <b>{gb}GB</b>\n\n"
+        f"<code>{vless}</code>"
+    )
+    res = await _call("sendMessage", chat_id=CHANNEL_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    if not res or not res.get("ok"):
+        await remove_link(uid)
+        return False, "ارسال به کانال ناموفق بود؛ عضویت ربات و دسترسی ارسال پیام را بررسی کن."
+    return True, vless
+
+async def _handle_free_command(chat_id: int):
+    key = _daily_free_key(chat_id)
+    if key in FREE_CLAIMS:
+        await _send(chat_id, "⏳ سهمیه رایگان امروزت قبلاً استفاده شده. فردا دوباره /free بزن.")
+        return
+    uid, link = await make_link(
+        label=f"Pixelgit Free 1GB · {now_ir().strftime('%Y-%m-%d')}",
+        limit_bytes=parse_size_to_bytes(1, "GB"),
+        expires_at=None,
+    )
+    FREE_CLAIMS[key] = {"uid": uid, "date": now_ir().strftime("%Y-%m-%d"), "chat_id": chat_id}
+    await save_state()
+    host = get_host()
+    vless = vless_link_for_link(link, uid, host)
+    await _send(chat_id, f"🎁 <b>کانفیگ رایگان امروز</b>\n\nحجم: <b>۱GB</b>\n\n<code>{vless}</code>\n\nفردا دوباره می‌تونی /free بگیری.")
+
 # ── Polling loop ─────────────────────────────────────────────────────────────
 async def _poll_loop():
     global _running
@@ -1070,9 +915,32 @@ async def _poll_loop():
             await asyncio.sleep(3)
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────
+async def configure_bot(token: str, admin_ids: list[int], channel_id: str = ""):
+    global BOT_TOKEN, ADMIN_IDS, CHANNEL_ID, API_BASE
+    token = (token or "").strip()
+    ADMIN_IDS = {int(x) for x in admin_ids if str(x).isdigit()}
+    CHANNEL_ID = (channel_id or "").strip()
+    if not token:
+        await stop_bot()
+        BOT_TOKEN = ""
+        API_BASE = "https://api.telegram.org/bot"
+        return "تنظیمات ذخیره شد؛ ربات خاموش است چون Bot Token خالی است."
+    BOT_TOKEN = token
+    API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    if _client is None:
+        # Start from scratch after initial empty configuration.
+        await start_bot()
+    else:
+        await stop_bot()
+        await start_bot()
+    return "تنظیمات ذخیره و ربات راه‌اندازی شد."
+
 async def start_bot():
-    global _client, _poll_task, _running
-    _load_bot_state()
+    global _client, _poll_task, _running, BOT_TOKEN, ADMIN_IDS, CHANNEL_ID, API_BASE
+    BOT_TOKEN = str(TELEGRAM_CONFIG.get("bot_token", BOT_TOKEN)).strip()
+    ADMIN_IDS = {int(x) for x in TELEGRAM_CONFIG.get("admin_ids", list(ADMIN_IDS)) if str(x).isdigit()}
+    CHANNEL_ID = str(TELEGRAM_CONFIG.get("channel_id", CHANNEL_ID)).strip()
+    API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
     if not BOT_TOKEN:
         logger.info("Telegram bot: TELEGRAM_BOT_TOKEN تنظیم نشده، ربات غیرفعاله.")
         return
